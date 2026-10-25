@@ -1,0 +1,154 @@
+
+name: NexusAPK Patcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_url:
+        description: "Enlace DIRECTO al APK en GitHub Releases"
+        required: true
+        type: string
+      patch_name:
+        description: "Nombre del parche (informativo)"
+        required: true
+        default: "patch-1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  patch:
+    name: Download, patch, rebuild and sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate input
+        env:
+          RELEASE_URL: ${{ inputs.release_url }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from urllib.parse import urlparse
+
+          url = urlparse(os.environ["RELEASE_URL"])
+          if url.scheme != "https" or url.hostname != "github.com":
+              raise SystemExit(
+                  "Usa un enlace HTTPS directo de un archivo de GitHub Releases."
+              )
+          if "/releases/download/" not in url.path:
+              raise SystemExit(
+                  "El enlace debe contener /releases/download/ y terminar en .apk"
+              )
+          if not url.path.lower().endswith(".apk"):
+              raise SystemExit("El enlace no parece apuntar a un archivo .apk")
+          print("Enlace directo validado.")
+          PY
+
+      - name: Download original APK
+        env:
+          RELEASE_URL: ${{ inputs.release_url }}
+        run: |
+          mkdir -p work output
+          curl --fail --location --retry 3 \
+            "$RELEASE_URL" \
+            --output work/original.apk
+          test -s work/original.apk
+          file work/original.apk
+          ls -lh work/original.apk
+
+      - name: Install Java and Android SDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android build tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install Apktool
+        run: |
+          curl --fail --location --retry 3 \
+            https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool \
+            --output /usr/local/bin/apktool
+          curl --fail --location --retry 3 \
+            https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.11.1.jar \
+            --output /usr/local/bin/apktool.jar
+          chmod +x /usr/local/bin/apktool
+          apktool --version
+
+      - name: Decode APK
+        run: |
+          apktool d work/original.apk \
+            --force \
+            --output work/decoded
+
+      - name: Apply patch overlay
+        run: |
+          python3 scripts/apply_patch.py \
+            work/decoded \
+            patches/overlay
+
+      - name: Rebuild APK
+        run: |
+          apktool b work/decoded \
+            --output work/rebuilt-unsigned.apk
+
+      - name: Align APK
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          BUILD_TOOLS="$(find "$SDK_ROOT/build-tools" \
+            -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          test -n "$BUILD_TOOLS"
+          "$BUILD_TOOLS/zipalign" -f -p 4 \
+            work/rebuilt-unsigned.apk \
+            work/aligned.apk
+          echo "BUILD_TOOLS=$BUILD_TOOLS" >> "$GITHUB_ENV"
+
+      - name: Create temporary signing key
+        run: |
+          keytool -genkeypair \
+            -keystore work/patch-key.jks \
+            -storepass patchpass123 \
+            -keypass patchpass123 \
+            -alias patchkey \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=NexusAPK Patcher"
+
+      - name: Sign APK
+        run: |
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks work/patch-key.jks \
+            --ks-key-alias patchkey \
+            --ks-pass pass:patchpass123 \
+            --key-pass pass:patchpass123 \
+            --out output/patched.apk \
+            work/aligned.apk
+
+          "$BUILD_TOOLS/apksigner" verify \
+            --verbose output/patched.apk
+
+      - name: Save build information
+        env:
+          PATCH_NAME: ${{ inputs.patch_name }}
+        run: |
+          {
+            echo "Patch: $PATCH_NAME"
+            echo "Original APK: downloaded from GitHub Releases"
+            echo "Build status: APK rebuilt and signature verified"
+          } > output/build-info.txt
+          ls -lh output/
+
+      - name: Upload patched APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NexusAPK-${{ inputs.patch_name }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 14
