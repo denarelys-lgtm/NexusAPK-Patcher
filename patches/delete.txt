@@ -1,0 +1,3 @@
+
+# Una ruta relativa por línea, desde la raíz del APK descompilado.
+# Deja este archivo así si no quieres eliminar ningún archivo.
