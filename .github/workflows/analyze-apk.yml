@@ -1,0 +1,198 @@
+
+name: Analyze Tango APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download Tango APK
+        run: |
+          mkdir -p work results
+          curl -fL --retry 3 \
+            "https://github.com/denarelys-lgtm/NexusAPK-Patcher/releases/download/Apk/tango-Tango_APK-android-9.62.9-20260609140828-production-assemblefullrelease-all.apk" \
+            -o work/tango.apk
+          test -s work/tango.apk
+          file work/tango.apk
+          sha256sum work/tango.apk | tee results/apk-sha256.txt
+          ls -lh work/tango.apk
+
+      - name: Download JADX
+        run: |
+          python3 - <<'PY'
+          import json
+          import urllib.request
+
+          url = "https://api.github.com/repos/skylot/jadx/releases/latest"
+          req = urllib.request.Request(
+              url, headers={"User-Agent": "NexusAPK-Patcher"}
+          )
+          with urllib.request.urlopen(req) as response:
+              release = json.load(response)
+
+          assets = [
+              asset["browser_download_url"]
+              for asset in release["assets"]
+              if asset["name"].endswith(".zip")
+              and "with-jre" in asset["name"].lower()
+          ]
+
+          if not assets:
+              assets = [
+                  asset["browser_download_url"]
+                  for asset in release["assets"]
+                  if asset["name"].endswith(".zip")
+              ]
+
+          if not assets:
+              raise SystemExit("No se encontró el ZIP de JADX.")
+
+          with open("work/jadx-url.txt", "w") as f:
+              f.write(assets[0])
+          print("JADX:", release["tag_name"], assets[0])
+          PY
+
+          curl -fL --retry 3 \
+            "$(cat work/jadx-url.txt)" \
+            -o work/jadx.zip
+          mkdir -p work/jadx
+          unzip -q work/jadx.zip -d work/jadx
+          JADX_BIN="$(find work/jadx -type f -name jadx \
+            ! -path '*/.*' | head -n 1)"
+          test -n "$JADX_BIN"
+          chmod +x "$JADX_BIN"
+          echo "JADX_BIN=$JADX_BIN" >> "$GITHUB_ENV"
+
+      - name: Download Apktool
+        run: |
+          curl -fL --retry 3 \
+            "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.11.1.jar" \
+            -o work/apktool.jar
+          test -s work/apktool.jar
+          java -jar work/apktool.jar --version
+
+      - name: Decompile Java sources with JADX
+        run: |
+          "$JADX_BIN" \
+            --threads-count 2 \
+            --show-bad-code \
+            --no-res \
+            -d work/jadx-source \
+            work/tango.apk \
+            2>&1 | tee results/jadx.log
+
+      - name: Decode resources and Smali with Apktool
+        run: |
+          java -jar work/apktool.jar d \
+            --force \
+            -f \
+            -o work/apktool-source \
+            work/tango.apk \
+            2>&1 | tee results/apktool.log
+
+      - name: Generate investigation report
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          roots = [
+              ("JADX", Path("work/jadx-source")),
+              ("APKTOOL", Path("work/apktool-source")),
+          ]
+
+          terms = re.compile(
+              r"\blive\b|livestream|broadcast|room.?chat|"
+              r"balance|coins?|wallet|country|region|"
+              r"message|private.?chat|conversation",
+              re.IGNORECASE,
+          )
+
+          report = Path("results/investigation.txt")
+          total = 0
+
+          with report.open("w", encoding="utf-8") as out:
+              out.write("TANGO APK - INVESTIGATION REPORT\n")
+              out.write("Search results are leads, not proof of behavior.\n\n")
+
+              for label, root in roots:
+                  out.write(f"\n=== {label} ===\n")
+                  if not root.exists():
+                      out.write("Directory missing.\n")
+                      continue
+
+                  matches = 0
+                  for path in root.rglob("*"):
+                      if not path.is_file():
+                          continue
+                      if path.suffix.lower() not in {
+                          ".java", ".smali", ".xml", ".json",
+                          ".kt", ".txt", ".properties"
+                      }:
+                          continue
+                      try:
+                          with path.open(
+                              "r", encoding="utf-8", errors="ignore"
+                          ) as src:
+                              for number, line in enumerate(src, 1):
+                                  if terms.search(line):
+                                      out.write(
+                                          f"{path}:{number}: "
+                                          f"{line.strip()[:400]}\n"
+                                      )
+                                      matches += 1
+                                      total += 1
+                                      if matches >= 15000:
+                                          out.write(
+                                              "Limit reached for this section.\n"
+                                          )
+                                          break
+                      except (OSError, UnicodeError):
+                          continue
+
+                      if matches >= 15000:
+                          break
+
+                  out.write(f"\nMatches in {label}: {matches}\n")
+
+              out.write(f"\nTOTAL MATCHES: {total}\n")
+
+          print(report.read_text(encoding="utf-8")[-3000:])
+          PY
+
+      - name: Package analysis results
+        if: always()
+        run: |
+          mkdir -p results
+          if [ -d work/jadx-source ]; then
+            zip -qr results/jadx-source.zip work/jadx-source
+          fi
+          if [ -d work/apktool-source ]; then
+            zip -qr results/apktool-source.zip work/apktool-source
+          fi
+          ls -lh results/
+
+      - name: Upload analysis artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tango-9.62.9-analysis
+          path: results/
+          if-no-files-found: warn
+          retention-days: 7
