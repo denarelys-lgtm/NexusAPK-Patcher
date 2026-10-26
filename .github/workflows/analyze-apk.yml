@@ -54,9 +54,11 @@ jobs:
           APK_SIZE=$(stat -c '%s' work/tango-original.apk)
           SHA256=$(sha256sum work/tango-original.apk | awk '{print $1}')
 
-          printf 'File: tango-original.apk\nSize bytes: %s\nSHA-256: %s\n' \
-            "$APK_SIZE" "$SHA256" \
-            | tee results/apk-sha256.txt
+          {
+            echo "File: tango-original.apk"
+            echo "Size bytes: $APK_SIZE"
+            echo "SHA-256: $SHA256"
+          } | tee results/apk-sha256.txt
 
           file work/tango-original.apk \
             | tee results/apk-file.txt
@@ -64,7 +66,7 @@ jobs:
           unzip -tq work/tango-original.apk \
             > results/apk-integrity.log
 
-          echo "APK download and ZIP integrity check passed."
+          echo "APK download and integrity check passed."
 
       - name: Download JADX CLI
         run: |
@@ -236,7 +238,6 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
-          import os
           import re
           from pathlib import Path
 
@@ -245,22 +246,17 @@ jobs:
           patterns = {
               "LIVE and streams": re.compile(
                   r"live|livestream|broadcast|streaming|"
-                  r"room.?chat|live.?room",
-                  re.I
+                  r"room.?chat|live.?room", re.I
               ),
               "Chat and messages": re.compile(
                   r"conversation|direct.?message|"
-                  r"message.?history|chat",
-                  re.I
+                  r"message.?history|chat", re.I
               ),
               "Balance and coins": re.compile(
-                  r"BalanceStorageData|wallet|coins|balance",
-                  re.I
+                  r"BalanceStorageData|wallet|coins|balance", re.I
               ),
               "Country and region": re.compile(
-                  r"country|region|country.?code|"
-                  r"location|locale",
-                  re.I
+                  r"country|region|country.?code|location|locale", re.I
               ),
           }
 
@@ -270,12 +266,11 @@ jobs:
           ]
 
           max_matches = 300
-          max_line_length = 350
           counts = {key: 0 for key in patterns}
 
           with output.open("w", encoding="utf-8") as report:
               report.write("TANGO 9.62.9 - INVESTIGATION REPORT\n")
-              report.write("=" * 48 + "\n\n")
+              report.write("=" * 48 + "\n")
 
               for filename in [
                   "apk-sha256.txt",
@@ -312,7 +307,7 @@ jobs:
                                   encoding="utf-8",
                                   errors="replace"
                               )
-                          except (OSError, UnicodeError):
+                          except OSError:
                               continue
 
                           for number, line in enumerate(
@@ -323,7 +318,7 @@ jobs:
                                   if counts[category] < max_matches:
                                       report.write(
                                           f"{path}:{number}: "
-                                          f"{line[:max_line_length]}\n"
+                                          f"{line[:350]}\n"
                                       )
                                       counts[category] += 1
 
@@ -334,39 +329,34 @@ jobs:
                       )
 
               report.write(
-                  "\nNOTE: Text matches are leads for investigation, "
-                  "not proof of implemented functionality.\n"
+                  "\nText matches are leads, not proof of functionality.\n"
               )
 
           print(f"Report written: {output}")
           PY
 
-      - name: Package analysis results
+      - name: Prepare analysis results
         if: always()
         run: |
           set -euo pipefail
 
           mkdir -p results
 
-          if [ -d work/jadx-out ]; then
-            zip -q -r results/jadx-source.zip work/jadx-out \
-              || echo "JADX archive incomplete"
-          fi
-
-          if [ -d work/apktool-out ]; then
-            zip -q -r results/apktool-source.zip work/apktool-out \
-              || echo "Apktool archive incomplete"
-          fi
-
           {
             echo "Analysis completed at: $(date -u +%FT%TZ)"
             echo
+            echo "JADX exit code:"
+            cat results/jadx-exit-code.txt 2>/dev/null || true
+            echo
+            echo "Apktool exit code:"
+            cat results/apktool-exit-code.txt 2>/dev/null || true
+            echo
+            echo "Generated source files:"
+            find work/jadx-out work/apktool-out \
+              -type f 2>/dev/null | wc -l || true
+            echo
             echo "Disk usage:"
             df -h .
-            echo
-            echo "Result files:"
-            find results -maxdepth 1 -type f \
-              -printf '%f %s bytes\n' | sort
           } > results/run-summary.txt
 
       - name: Upload analysis artifacts
@@ -374,6 +364,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Tango-9.62.9-analysis
-          path: results/
+          path: |
+            results/
+            work/jadx-out/
+            work/apktool-out/
           if-no-files-found: warn
+          compression-level: 0
           retention-days: 7
