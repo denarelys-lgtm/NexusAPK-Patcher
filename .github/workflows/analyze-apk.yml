@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: tango-apk-analysis
+  cancel-in-progress: false
+
 jobs:
   analyze:
     runs-on: ubuntu-latest
@@ -16,177 +20,354 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Download Tango APK
+      - name: Install analysis tools
         run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl unzip zip python3 file
+
+      - name: Prepare workspace
+        run: |
+          set -euo pipefail
           mkdir -p work results
-          curl -fL --retry 3 \
-            "https://github.com/denarelys-lgtm/NexusAPK-Patcher/releases/download/Apk/tango-Tango_APK-android-9.62.9-20260609140828-production-assemblefullrelease-all.apk" \
-            -o work/tango.apk
-          test -s work/tango.apk
-          file work/tango.apk
-          sha256sum work/tango.apk | tee results/apk-sha256.txt
-          ls -lh work/tango.apk
+          df -h .
+          java -version
 
-      - name: Download JADX
+      - name: Download original APK
+        env:
+          APK_URL: https://github.com/denarelys-lgtm/NexusAPK-Patcher/releases/download/Apk/tango-Tango_APK-android-9.62.9-20260609140828-production-assemblefullrelease-all.apk
         run: |
+          set -euo pipefail
+
+          curl -fL --retry 3 --retry-delay 2 \
+            "$APK_URL" \
+            -o work/tango-original.apk
+
+          test -s work/tango-original.apk
+
+          APK_SIZE=$(stat -c '%s' work/tango-original.apk)
+          SHA256=$(sha256sum work/tango-original.apk | awk '{print $1}')
+
+          printf 'File: tango-original.apk\nSize bytes: %s\nSHA-256: %s\n' \
+            "$APK_SIZE" "$SHA256" \
+            | tee results/apk-sha256.txt
+
+          file work/tango-original.apk \
+            | tee results/apk-file.txt
+
+          unzip -tq work/tango-original.apk \
+            > results/apk-integrity.log
+
+          echo "APK download and ZIP integrity check passed."
+
+      - name: Download JADX CLI
+        run: |
+          set -euo pipefail
+          mkdir -p work/jadx
+
           python3 - <<'PY'
           import json
           import urllib.request
 
           url = "https://api.github.com/repos/skylot/jadx/releases/latest"
           req = urllib.request.Request(
-              url, headers={"User-Agent": "NexusAPK-Patcher"}
+              url,
+              headers={"User-Agent": "NexusAPK-Patcher"}
           )
-          with urllib.request.urlopen(req) as response:
+
+          with urllib.request.urlopen(req, timeout=30) as response:
               release = json.load(response)
 
           assets = [
               asset["browser_download_url"]
-              for asset in release["assets"]
-              if asset["name"].endswith(".zip")
-              and "with-jre" in asset["name"].lower()
+              for asset in release.get("assets", [])
+              if asset["name"].startswith("jadx-")
+              and not asset["name"].startswith("jadx-gui-")
+              and asset["name"].endswith(".zip")
           ]
 
           if not assets:
-              assets = [
-                  asset["browser_download_url"]
-                  for asset in release["assets"]
-                  if asset["name"].endswith(".zip")
-              ]
+              raise SystemExit(
+                  "No se encontró el ZIP CLI de JADX."
+              )
 
-          if not assets:
-              raise SystemExit("No se encontró el ZIP de JADX.")
+          selected = assets[0]
 
           with open("work/jadx-url.txt", "w") as f:
-              f.write(assets[0])
-          print("JADX:", release["tag_name"], assets[0])
+              f.write(selected)
+
+          print("JADX version:", release["tag_name"])
+          print("JADX URL:", selected)
           PY
 
           curl -fL --retry 3 \
             "$(cat work/jadx-url.txt)" \
             -o work/jadx.zip
-          mkdir -p work/jadx
+
           unzip -q work/jadx.zip -d work/jadx
-          JADX_BIN="$(find work/jadx -type f -name jadx \
-            ! -path '*/.*' | head -n 1)"
-          test -n "$JADX_BIN"
+
+          JADX_BIN="$(find work/jadx -type f \
+            -name jadx -print -quit)"
+
+          if [ -z "$JADX_BIN" ]; then
+            echo "::error::JADX CLI executable not found."
+            find work/jadx -maxdepth 4 -type f | head -80
+            exit 1
+          fi
+
           chmod +x "$JADX_BIN"
+          "$JADX_BIN" --version
+
           echo "JADX_BIN=$JADX_BIN" >> "$GITHUB_ENV"
 
       - name: Download Apktool
         run: |
+          set -euo pipefail
+
+          APKTOOL_URL="https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar"
+
           curl -fL --retry 3 \
-            "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.11.1.jar" \
+            "$APKTOOL_URL" \
             -o work/apktool.jar
+
           test -s work/apktool.jar
           java -jar work/apktool.jar --version
 
-      - name: Decompile Java sources with JADX
+      - name: Extract APK metadata
         run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import zipfile
+          from collections import Counter
+
+          apk = "work/tango-original.apk"
+
+          with zipfile.ZipFile(apk) as z:
+              names = z.namelist()
+              counts = Counter()
+
+              for name in names:
+                  if name.endswith(".dex"):
+                      counts["dex"] += 1
+                  elif name.startswith("lib/") and name.endswith(".so"):
+                      counts["native_libraries"] += 1
+                  elif name.startswith("res/"):
+                      counts["resources"] += 1
+
+              with open("results/apk-structure.txt", "w") as f:
+                  f.write(f"Total ZIP entries: {len(names)}\n")
+                  for key, value in sorted(counts.items()):
+                      f.write(f"{key}: {value}\n")
+
+                  f.write("\nDEX files:\n")
+                  for name in names:
+                      if name.endswith(".dex"):
+                          f.write(name + "\n")
+
+                  f.write("\nNative libraries:\n")
+                  for name in names:
+                      if name.startswith("lib/") and name.endswith(".so"):
+                          f.write(name + "\n")
+
+              print(open("results/apk-structure.txt").read())
+          PY
+
+      - name: Decompile with JADX
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+
+          mkdir -p work/jadx-out
+
+          set +e
           "$JADX_BIN" \
             --threads-count 2 \
             --show-bad-code \
-            --no-res \
-            -d work/jadx-source \
-            work/tango.apk \
-            2>&1 | tee results/jadx.log
+            -d work/jadx-out \
+            work/tango-original.apk \
+            > results/jadx.log 2>&1
+
+          STATUS=$?
+          set -e
+
+          echo "$STATUS" > results/jadx-exit-code.txt
+
+          if [ "$STATUS" -eq 0 ]; then
+            echo "JADX completed successfully."
+          else
+            echo "::warning::JADX exited with code $STATUS"
+            tail -80 results/jadx.log || true
+          fi
 
       - name: Decode resources and Smali with Apktool
+        continue-on-error: true
         run: |
-          java -jar work/apktool.jar d \
-            --force \
-            -f \
-            -o work/apktool-source \
-            work/tango.apk \
-            2>&1 | tee results/apktool.log
+          set -uo pipefail
+
+          set +e
+          java -Xmx4g -jar work/apktool.jar \
+            d -f \
+            work/tango-original.apk \
+            -o work/apktool-out \
+            > results/apktool.log 2>&1
+
+          STATUS=$?
+          set -e
+
+          echo "$STATUS" > results/apktool-exit-code.txt
+
+          if [ "$STATUS" -eq 0 ]; then
+            echo "Apktool completed successfully."
+          else
+            echo "::warning::Apktool exited with code $STATUS"
+            tail -80 results/apktool.log || true
+          fi
 
       - name: Generate investigation report
+        if: always()
         run: |
+          set -euo pipefail
+
           python3 - <<'PY'
-          from pathlib import Path
+          import os
           import re
+          from pathlib import Path
+
+          output = Path("results/investigation.txt")
+
+          patterns = {
+              "LIVE and streams": re.compile(
+                  r"live|livestream|broadcast|streaming|"
+                  r"room.?chat|live.?room",
+                  re.I
+              ),
+              "Chat and messages": re.compile(
+                  r"conversation|direct.?message|"
+                  r"message.?history|chat",
+                  re.I
+              ),
+              "Balance and coins": re.compile(
+                  r"BalanceStorageData|wallet|coins|balance",
+                  re.I
+              ),
+              "Country and region": re.compile(
+                  r"country|region|country.?code|"
+                  r"location|locale",
+                  re.I
+              ),
+          }
 
           roots = [
-              ("JADX", Path("work/jadx-source")),
-              ("APKTOOL", Path("work/apktool-source")),
+              Path("work/jadx-out"),
+              Path("work/apktool-out"),
           ]
 
-          terms = re.compile(
-              r"\blive\b|livestream|broadcast|room.?chat|"
-              r"balance|coins?|wallet|country|region|"
-              r"message|private.?chat|conversation",
-              re.IGNORECASE,
-          )
+          max_matches = 300
+          max_line_length = 350
+          counts = {key: 0 for key in patterns}
 
-          report = Path("results/investigation.txt")
-          total = 0
+          with output.open("w", encoding="utf-8") as report:
+              report.write("TANGO 9.62.9 - INVESTIGATION REPORT\n")
+              report.write("=" * 48 + "\n\n")
 
-          with report.open("w", encoding="utf-8") as out:
-              out.write("TANGO APK - INVESTIGATION REPORT\n")
-              out.write("Search results are leads, not proof of behavior.\n\n")
+              for filename in [
+                  "apk-sha256.txt",
+                  "apk-file.txt",
+                  "apk-structure.txt",
+                  "jadx-exit-code.txt",
+                  "apktool-exit-code.txt",
+              ]:
+                  path = Path("results") / filename
+                  report.write(f"\n--- {filename} ---\n")
+                  if path.exists():
+                      report.write(
+                          path.read_text(errors="replace")[:20000]
+                      )
+                  else:
+                      report.write("Not available\n")
 
-              for label, root in roots:
-                  out.write(f"\n=== {label} ===\n")
-                  if not root.exists():
-                      out.write("Directory missing.\n")
-                      continue
+              for category, pattern in patterns.items():
+                  report.write(f"\n\n--- {category} ---\n")
+                  total = 0
 
-                  matches = 0
-                  for path in root.rglob("*"):
-                      if not path.is_file():
+                  for root in roots:
+                      if not root.exists():
                           continue
-                      if path.suffix.lower() not in {
-                          ".java", ".smali", ".xml", ".json",
-                          ".kt", ".txt", ".properties"
-                      }:
-                          continue
-                      try:
-                          with path.open(
-                              "r", encoding="utf-8", errors="ignore"
-                          ) as src:
-                              for number, line in enumerate(src, 1):
-                                  if terms.search(line):
-                                      out.write(
+
+                      for path in root.rglob("*"):
+                          if not path.is_file():
+                              continue
+
+                          try:
+                              if path.stat().st_size > 2_000_000:
+                                  continue
+                              text = path.read_text(
+                                  encoding="utf-8",
+                                  errors="replace"
+                              )
+                          except (OSError, UnicodeError):
+                              continue
+
+                          for number, line in enumerate(
+                              text.splitlines(), 1
+                          ):
+                              if pattern.search(line):
+                                  total += 1
+                                  if counts[category] < max_matches:
+                                      report.write(
                                           f"{path}:{number}: "
-                                          f"{line.strip()[:400]}\n"
+                                          f"{line[:max_line_length]}\n"
                                       )
-                                      matches += 1
-                                      total += 1
-                                      if matches >= 15000:
-                                          out.write(
-                                              "Limit reached for this section.\n"
-                                          )
-                                          break
-                      except (OSError, UnicodeError):
-                          continue
+                                      counts[category] += 1
 
-                      if matches >= 15000:
-                          break
+                  report.write(f"Matches found: {total}\n")
+                  if total > max_matches:
+                      report.write(
+                          f"Output capped at {max_matches} matches.\n"
+                      )
 
-                  out.write(f"\nMatches in {label}: {matches}\n")
+              report.write(
+                  "\nNOTE: Text matches are leads for investigation, "
+                  "not proof of implemented functionality.\n"
+              )
 
-              out.write(f"\nTOTAL MATCHES: {total}\n")
-
-          print(report.read_text(encoding="utf-8")[-3000:])
+          print(f"Report written: {output}")
           PY
 
       - name: Package analysis results
         if: always()
         run: |
+          set -euo pipefail
+
           mkdir -p results
-          if [ -d work/jadx-source ]; then
-            zip -qr results/jadx-source.zip work/jadx-source
+
+          if [ -d work/jadx-out ]; then
+            zip -q -r results/jadx-source.zip work/jadx-out \
+              || echo "JADX archive incomplete"
           fi
-          if [ -d work/apktool-source ]; then
-            zip -qr results/apktool-source.zip work/apktool-source
+
+          if [ -d work/apktool-out ]; then
+            zip -q -r results/apktool-source.zip work/apktool-out \
+              || echo "Apktool archive incomplete"
           fi
-          ls -lh results/
+
+          {
+            echo "Analysis completed at: $(date -u +%FT%TZ)"
+            echo
+            echo "Disk usage:"
+            df -h .
+            echo
+            echo "Result files:"
+            find results -maxdepth 1 -type f \
+              -printf '%f %s bytes\n' | sort
+          } > results/run-summary.txt
 
       - name: Upload analysis artifacts
         if: always()
