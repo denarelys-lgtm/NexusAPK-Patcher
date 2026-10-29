@@ -32,7 +32,7 @@ jobs:
           sudo apt-get install -y curl unzip python3 file ripgrep
 
       - name: Prepare folders
-        run: mkdir -p work results package
+        run: mkdir -p work results package/source-context
 
       - name: Download original APK and record hash
         env:
@@ -90,7 +90,7 @@ jobs:
           find work/jadx-out -type f -name '*.java' | wc -l > results/java-file-count.txt
           echo "JADX exit code: $STATUS; Java files: $(cat results/java-file-count.txt)"
 
-      - name: Build cross-reference and call-chain reports
+      - name: Build advanced cross-reference and call-chain reports
         if: always()
         run: |
           set -euo pipefail
@@ -102,6 +102,7 @@ jobs:
           root = Path("work/jadx-out")
           outdir = Path("results")
           source_ext = {".java", ".kt", ".xml", ".json", ".txt"}
+          
           targets = {
               "UserBalanceResponse": re.compile(r"\bUserBalanceResponse\b"),
               "GiftBalanceResponse": re.compile(r"\bGiftBalanceResponse\b"),
@@ -115,6 +116,7 @@ jobs:
               "ChatActivity": re.compile(r"\bChatActivity\b"),
               "ChatRequestInboxActivity": re.compile(r"\bChatRequestInboxActivity\b"),
           }
+          
           network = re.compile(
               r"@(?:GET|POST|PUT|PATCH|DELETE|HTTP|Headers)\b|"
               r"\b(?:baseUrl|newCall|enqueue|execute|Request\.Builder|"
@@ -123,6 +125,7 @@ jobs:
               r"""["']/(?:v[0-9]+/)?[A-Za-z0-9_./{}?=&-]{2,}["']""",
               re.I
           )
+          
           feature_terms = re.compile(
               r"\b(?:balance|coins?|giftbalance|country|region|live|broadcast|"
               r"stream|chat|conversation|endpoint|request|response|repository|api)\b",
@@ -146,11 +149,11 @@ jobs:
               except OSError:
                   text_cache[p] = []
 
+          # 1. Cross reference index
           index_path = outdir / "cross-reference-index.txt"
           with index_path.open("w", encoding="utf-8") as o:
               o.write("CROSS-REFERENCE INDEX\n")
               o.write(f"Files scanned: {len(files)}\n")
-              o.write("Each entry lists every source file containing the symbol and matching line numbers.\n")
               for name, pat in targets.items():
                   o.write("\n" + "=" * 70 + "\n" + name + "\n" + "=" * 70 + "\n")
                   hits = 0
@@ -161,11 +164,10 @@ jobs:
                           o.write(f"{p} :: lines {','.join(map(str, nums[:100]))}\n")
                   o.write(f"Total matching lines: {hits}\n")
 
-          # Detailed excerpts for the important symbols; each match includes surrounding context.
+          # 2. Detailed excerpts
           details_path = outdir / "model-and-feature-usage.txt"
           with details_path.open("w", encoding="utf-8") as o:
               o.write("MODEL / FEATURE USAGE EXCERPTS\n")
-              o.write("Static decompilation may be incomplete; validate unusual control flow before conclusions.\n")
               for name, pat in targets.items():
                   o.write("\n\n" + "#" * 78 + "\n" + name + "\n" + "#" * 78 + "\n")
                   matches = 0
@@ -178,24 +180,22 @@ jobs:
                               o.write(f"{'>>' if j == i else '  '} {j+1}: {lines[j][:400]}\n")
                           matches += 1
                           if matches >= 80:
-                              o.write("Per-symbol excerpt cap reached.\n")
                               break
                       if matches >= 80:
                           break
                   o.write(f"\nExcerpts emitted: {matches}\n")
 
-          # Network declarations and route strings near feature-relevant code.
+          # 3. Network candidates & Retrofit interfaces detection
           net_path = outdir / "network-candidates.txt"
           with net_path.open("w", encoding="utf-8") as o:
               o.write("NETWORK DECLARATIONS / ROUTE CANDIDATES\n")
-              o.write("These are candidates; strings may be library or unrelated endpoints.\n")
               count = 0
               for p, lines in text_cache.items():
-                  # Prioritize files that also mention target features/models.
                   joined = "\n".join(lines)
                   relevant = bool(feature_terms.search(joined))
+                  is_retrofit_interface = "@GET" in joined or "@POST" in joined
                   for i, line in enumerate(lines):
-                      if not network.search(line):
+                      if not network.search(line) and not is_retrofit_interface:
                           continue
                       if not relevant and count > 1200:
                           continue
@@ -203,33 +203,30 @@ jobs:
                       for j in range(max(0, i-5), min(len(lines), i+6)):
                           o.write(f"{'>>' if j == i else '  '} {j+1}: {lines[j][:400]}\n")
                       count += 1
-                      if count >= 1800:
+                      if count >= 2000:
                           o.write("\nGlobal candidate cap reached.\n")
                           break
-                  if count >= 1800:
+                  if count >= 2000:
                       break
               o.write(f"\nCandidate locations emitted: {count}\n")
 
-          # Save a list of files likely to be the caller / repository / API implementation.
+          # 4. Likely callers & Retrofit services shortlist
           shortlist = outdir / "likely-callers.txt"
           with shortlist.open("w", encoding="utf-8") as o:
-              o.write("LIKELY CALLER / API FILES\n")
-              o.write("Prioritized by co-occurrence of model/feature terms and network declarations.\n")
+              o.write("LIKELY CALLER / API / RETROFIT FILES\n")
               ranked = []
               for p, lines in text_cache.items():
                   joined = "\n".join(lines)
                   target_count = sum(bool(pat.search(joined)) for pat in targets.values())
                   net_count = sum(1 for line in lines if network.search(line))
-                  feat_count = sum(1 for line in lines if feature_terms.search(line))
-                  score = target_count * 5 + min(net_count, 30) * 2 + min(feat_count, 80) // 4
-                  if score > 0 and (net_count or target_count):
+                  is_api = 10 if ("@GET" in joined or "@POST" in joined) else 0
+                  score = target_count * 5 + min(net_count, 30) * 2 + is_api
+                  if score > 0:
                       ranked.append((score, net_count, target_count, p))
-              for score, net_count, target_count, p in sorted(ranked, reverse=True)[:250]:
+              for score, net_count, target_count, p in sorted(ranked, reverse=True)[:300]:
                   o.write(f"score={score} network_lines={net_count} target_symbols={target_count} file={p}\n")
 
-          print("Scanned", len(files), "files")
-          for p in [index_path, details_path, net_path, shortlist]:
-              print(p, p.stat().st_size, "bytes")
+          print("Analysis completed successfully.")
           PY
 
       - name: Assemble compact package
@@ -240,7 +237,7 @@ jobs:
           cp results/*.txt package/ 2>/dev/null || true
           cp results/*.log package/ 2>/dev/null || true
 
-          # Include complete source files for directly identified models and known processors.
+          # 1. Copiar clases clave conocidas y modelos
           find work/jadx-out -type f \
             \( -name '*UserBalanceResponse*' \
             -o -name '*GiftBalanceResponse*' \
@@ -257,6 +254,27 @@ jobs:
             -size -2M \
             -exec cp --parents {} package/source-context/ \; \
             2>/dev/null || true
+
+          # 2. Copiar automáticamente archivos que contengan anotaciones Retrofit (@GET / @POST) relacionadas con balance/stream/chat
+          python3 - <<'PY'
+          import shutil
+          from pathlib import Path
+
+          root = Path("work/jadx-out")
+          dest = Path("package/source-context")
+          
+          if root.exists():
+              for p in root.rglob("*.java"):
+                  try:
+                      text = p.read_text(encoding="utf-8", errors="replace")
+                      if ("@GET" in text or "@POST" in text) and any(k in text.lower() for k in ["balance", "gift", "coin", "savings", "live", "chat"]):
+                          rel = p.relative_to(root)
+                          target_path = dest / rel
+                          target_path.parent.mkdir(parents=True, exist_ok=True)
+                          shutil.copy2(p, target_path)
+                  except Exception:
+                      pass
+          PY
 
           {
             echo "Completed UTC: $(date -u +%FT%TZ)"
