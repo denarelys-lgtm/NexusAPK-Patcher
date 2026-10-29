@@ -1,4 +1,4 @@
-name: Trace Tango References
+name: Trace Tango API Call Chains
 
 on:
   workflow_dispatch:
@@ -7,13 +7,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: tango-reference-trace
+  group: tango-api-call-chains
   cancel-in-progress: false
 
 jobs:
   trace:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
 
     steps:
       - name: Checkout repository
@@ -29,12 +29,12 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y curl unzip python3 file
+          sudo apt-get install -y curl unzip python3 file ripgrep
 
       - name: Prepare folders
         run: mkdir -p work results package
 
-      - name: Download original APK
+      - name: Download original APK and record hash
         env:
           APK_URL: https://github.com/denarelys-lgtm/NexusAPK-Patcher/releases/download/Apk/tango-Tango_APK-android-9.62.9-20260609140828-production-assemblefullrelease-all.apk
         run: |
@@ -63,10 +63,11 @@ jobs:
               and a["name"].endswith(".zip")
           ]
           if not assets:
-              raise SystemExit("No JADX CLI ZIP found")
-          print("JADX release:", release["tag_name"])
+              raise SystemExit("No JADX CLI ZIP found in latest release")
           with open("work/jadx-url.txt", "w") as f:
               f.write(assets[0])
+          print("Selected JADX release:", release.get("tag_name"))
+          print("Selected asset:", assets[0])
           PY
           curl -fL --retry 3 "$(cat work/jadx-url.txt)" -o work/jadx.zip
           unzip -q work/jadx.zip -d work/jadx
@@ -86,122 +87,167 @@ jobs:
           STATUS=$?
           set -e
           echo "$STATUS" > results/jadx-exit-code.txt
-          echo "JADX exit code: $STATUS"
-          find work/jadx-out -type f -name '*.java' | wc -l | tee results/java-file-count.txt
+          find work/jadx-out -type f -name '*.java' | wc -l > results/java-file-count.txt
+          echo "JADX exit code: $STATUS; Java files: $(cat results/java-file-count.txt)"
 
-      - name: Trace model usages and feature call sites
+      - name: Build cross-reference and call-chain reports
         if: always()
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import re
           from pathlib import Path
+          from collections import defaultdict
 
           root = Path("work/jadx-out")
-          out = Path("results/reference-trace.txt")
-          # Search full decompilation, not only files with matching names.
-          groups = {
-              "Balance response model references": re.compile(
-                  r"UserBalanceResponse|GiftBalanceResponse|"
-                  r"PromotionCoinsClaimResponse|SavingsBalanceResponseProto"
-              ),
-              "Balance and coin logic": re.compile(
-                  r"userBalance|giftBalance|coinback|coinsBalance|"
-                  r"insufficient.?balance|claimCoinback|"
-                  r"PromotionCoinsAccessibilityResponse", re.I
-              ),
-              "Country picker and filtering": re.compile(
-                  r"LiveCountryChooserActivity|LiveCountryPickerFragment|"
-                  r"NearbyCountries|country.?code|country.?filter|"
-                  r"selectedCountries|initialCheckedList", re.I
-              ),
-              "LIVE viewer and discovery": re.compile(
-                  r"LiveViewerActivity|LiveViewerFragment|"
-                  r"LivePagingConfig|live.?viewer|live.?broadcast|"
-                  r"stream.?discovery|broadcast.?list", re.I
-              ),
-              "Chat repositories and navigation": re.compile(
-                  r"ChatActivity|ChatRequestInboxActivity|"
-                  r"conversationId|deleteAllChatRequest|"
-                  r"observeChat|syncFoldersForChat", re.I
-              ),
-              "Network declarations and request execution": re.compile(
-                  r"@GET|@POST|@PUT|@PATCH|@DELETE|"
-                  r"Retrofit|Request\.Builder|HttpUrl|"
-                  r"baseUrl|endpoint|GraphQL|grpc|"
-                  r"OkHttpClient|newCall\(", re.I
-              ),
-              "Potential endpoint strings": re.compile(
-                  r"""["']/(?:v[0-9]+/)?[A-Za-z0-9_./{}-]{2,}["']"""
-              ),
+          outdir = Path("results")
+          source_ext = {".java", ".kt", ".xml", ".json", ".txt"}
+          targets = {
+              "UserBalanceResponse": re.compile(r"\bUserBalanceResponse\b"),
+              "GiftBalanceResponse": re.compile(r"\bGiftBalanceResponse\b"),
+              "PromotionCoinsClaimResponse": re.compile(r"\bPromotionCoinsClaimResponse\b"),
+              "UserBalance": re.compile(r"\bUserBalance\b"),
+              "GiftBalance": re.compile(r"\bGiftBalance\b"),
+              "LiveCountryChooserActivity": re.compile(r"\bLiveCountryChooserActivity\b"),
+              "LiveCountryPickerFragment": re.compile(r"\bLiveCountryPickerFragment\b"),
+              "LiveViewerActivity": re.compile(r"\bLiveViewerActivity\b"),
+              "LiveViewerFragment": re.compile(r"\bLiveViewerFragment\b"),
+              "ChatActivity": re.compile(r"\bChatActivity\b"),
+              "ChatRequestInboxActivity": re.compile(r"\bChatRequestInboxActivity\b"),
           }
+          network = re.compile(
+              r"@(?:GET|POST|PUT|PATCH|DELETE|HTTP|Headers)\b|"
+              r"\b(?:baseUrl|newCall|enqueue|execute|Request\.Builder|"
+              r"Retrofit|OkHttpClient|GraphQL|grpc|HttpUrl|"
+              r"api/client/balance)\b|"
+              r"""["']/(?:v[0-9]+/)?[A-Za-z0-9_./{}?=&-]{2,}["']""",
+              re.I
+          )
+          feature_terms = re.compile(
+              r"\b(?:balance|coins?|giftbalance|country|region|live|broadcast|"
+              r"stream|chat|conversation|endpoint|request|response|repository|api)\b",
+              re.I
+          )
 
-          MAX_PER_GROUP = 180
-          MAX_LINE = 500
-          with out.open("w", encoding="utf-8") as report:
-              report.write("TANGO REFERENCE TRACE\n")
-              report.write("Searches are static leads, not proof of live server behavior.\n")
-              report.write("APK SHA-256:\n")
-              sha = Path("results/apk-sha256.txt")
-              if sha.exists():
-                  report.write(sha.read_text(errors="replace") + "\n")
-
-              for label, pattern in groups.items():
-                  report.write("\n\n" + "=" * 76 + "\n")
-                  report.write(label + "\n")
-                  report.write("=" * 76 + "\n")
-                  count = 0
-                  files_with_hits = 0
-                  if not root.exists():
-                      report.write("JADX output directory is missing.\n")
-                      continue
-                  for path in root.rglob("*"):
-                      if not path.is_file() or path.suffix not in {".java", ".kt", ".xml", ".json", ".txt"}:
-                          continue
+          files = []
+          if root.exists():
+              for p in root.rglob("*"):
+                  if p.is_file() and p.suffix in source_ext:
                       try:
-                          if path.stat().st_size > 3_000_000:
-                              continue
-                          lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                          if p.stat().st_size <= 3_000_000:
+                              files.append(p)
                       except OSError:
-                          continue
-                      local = []
-                      for i, line in enumerate(lines):
-                          if pattern.search(line):
-                              local.append((i, line))
-                      if not local:
-                          continue
-                      files_with_hits += 1
-                      for i, line in local:
-                          if count >= MAX_PER_GROUP:
-                              break
-                          report.write(f"\nFILE: {path}\nLINE: {i+1}\n")
-                          start, end = max(0, i-4), min(len(lines), i+5)
-                          for j in range(start, end):
-                              marker = ">>" if j == i else "  "
-                              report.write(f"{marker} {j+1}: {lines[j][:MAX_LINE]}\n")
-                          count += 1
-                      if count >= MAX_PER_GROUP:
-                          break
-                  report.write(f"\nReported matches: {count}; files with hits scanned: {files_with_hits}\n")
-                  if count >= MAX_PER_GROUP:
-                      report.write("Output capped for package size. Increase MAX_PER_GROUP if needed.\n")
+                          pass
 
-          # Copy exact feature files plus report and logs for compact review.
-          print("Created", out, "bytes:", out.stat().st_size)
+          text_cache = {}
+          for p in files:
+              try:
+                  text_cache[p] = p.read_text(encoding="utf-8", errors="replace").splitlines()
+              except OSError:
+                  text_cache[p] = []
+
+          index_path = outdir / "cross-reference-index.txt"
+          with index_path.open("w", encoding="utf-8") as o:
+              o.write("CROSS-REFERENCE INDEX\n")
+              o.write(f"Files scanned: {len(files)}\n")
+              o.write("Each entry lists every source file containing the symbol and matching line numbers.\n")
+              for name, pat in targets.items():
+                  o.write("\n" + "=" * 70 + "\n" + name + "\n" + "=" * 70 + "\n")
+                  hits = 0
+                  for p, lines in text_cache.items():
+                      nums = [i + 1 for i, line in enumerate(lines) if pat.search(line)]
+                      if nums:
+                          hits += len(nums)
+                          o.write(f"{p} :: lines {','.join(map(str, nums[:100]))}\n")
+                  o.write(f"Total matching lines: {hits}\n")
+
+          # Detailed excerpts for the important symbols; each match includes surrounding context.
+          details_path = outdir / "model-and-feature-usage.txt"
+          with details_path.open("w", encoding="utf-8") as o:
+              o.write("MODEL / FEATURE USAGE EXCERPTS\n")
+              o.write("Static decompilation may be incomplete; validate unusual control flow before conclusions.\n")
+              for name, pat in targets.items():
+                  o.write("\n\n" + "#" * 78 + "\n" + name + "\n" + "#" * 78 + "\n")
+                  matches = 0
+                  for p, lines in text_cache.items():
+                      for i, line in enumerate(lines):
+                          if not pat.search(line):
+                              continue
+                          o.write(f"\nFILE: {p}\nMATCH LINE: {i+1}\n")
+                          for j in range(max(0, i-12), min(len(lines), i+13)):
+                              o.write(f"{'>>' if j == i else '  '} {j+1}: {lines[j][:400]}\n")
+                          matches += 1
+                          if matches >= 80:
+                              o.write("Per-symbol excerpt cap reached.\n")
+                              break
+                      if matches >= 80:
+                          break
+                  o.write(f"\nExcerpts emitted: {matches}\n")
+
+          # Network declarations and route strings near feature-relevant code.
+          net_path = outdir / "network-candidates.txt"
+          with net_path.open("w", encoding="utf-8") as o:
+              o.write("NETWORK DECLARATIONS / ROUTE CANDIDATES\n")
+              o.write("These are candidates; strings may be library or unrelated endpoints.\n")
+              count = 0
+              for p, lines in text_cache.items():
+                  # Prioritize files that also mention target features/models.
+                  joined = "\n".join(lines)
+                  relevant = bool(feature_terms.search(joined))
+                  for i, line in enumerate(lines):
+                      if not network.search(line):
+                          continue
+                      if not relevant and count > 1200:
+                          continue
+                      o.write(f"\nFILE: {p}\nLINE: {i+1}\n")
+                      for j in range(max(0, i-5), min(len(lines), i+6)):
+                          o.write(f"{'>>' if j == i else '  '} {j+1}: {lines[j][:400]}\n")
+                      count += 1
+                      if count >= 1800:
+                          o.write("\nGlobal candidate cap reached.\n")
+                          break
+                  if count >= 1800:
+                      break
+              o.write(f"\nCandidate locations emitted: {count}\n")
+
+          # Save a list of files likely to be the caller / repository / API implementation.
+          shortlist = outdir / "likely-callers.txt"
+          with shortlist.open("w", encoding="utf-8") as o:
+              o.write("LIKELY CALLER / API FILES\n")
+              o.write("Prioritized by co-occurrence of model/feature terms and network declarations.\n")
+              ranked = []
+              for p, lines in text_cache.items():
+                  joined = "\n".join(lines)
+                  target_count = sum(bool(pat.search(joined)) for pat in targets.values())
+                  net_count = sum(1 for line in lines if network.search(line))
+                  feat_count = sum(1 for line in lines if feature_terms.search(line))
+                  score = target_count * 5 + min(net_count, 30) * 2 + min(feat_count, 80) // 4
+                  if score > 0 and (net_count or target_count):
+                      ranked.append((score, net_count, target_count, p))
+              for score, net_count, target_count, p in sorted(ranked, reverse=True)[:250]:
+                  o.write(f"score={score} network_lines={net_count} target_symbols={target_count} file={p}\n")
+
+          print("Scanned", len(files), "files")
+          for p in [index_path, details_path, net_path, shortlist]:
+              print(p, p.stat().st_size, "bytes")
           PY
 
-      - name: Build compact package
+      - name: Assemble compact package
         if: always()
         run: |
           set -euo pipefail
-          mkdir -p package/relevant-source
-          cp results/* package/ 2>/dev/null || true
+          mkdir -p package/source-context
+          cp results/*.txt package/ 2>/dev/null || true
+          cp results/*.log package/ 2>/dev/null || true
 
-          # Copy the main feature/model classes when available.
+          # Include complete source files for directly identified models and known processors.
           find work/jadx-out -type f \
             \( -name '*UserBalanceResponse*' \
             -o -name '*GiftBalanceResponse*' \
             -o -name '*PromotionCoinsClaimResponse*' \
+            -o -path '*/HY0/c.java' \
+            -o -path '*/p3902ts/b.java' \
+            -o -path '*/p1887e10/f.java' \
             -o -name '*LiveCountryChooserActivity*' \
             -o -name '*LiveCountryPickerFragment*' \
             -o -name '*LiveViewerActivity*' \
@@ -209,25 +255,27 @@ jobs:
             -o -name '*ChatActivity*' \
             -o -name '*ChatRequestInbox*' \) \
             -size -2M \
-            -exec cp --parents {} package/relevant-source/ \; \
+            -exec cp --parents {} package/source-context/ \; \
             2>/dev/null || true
 
           {
             echo "Completed UTC: $(date -u +%FT%TZ)"
+            echo "APK hash: $(awk '{print $1}' results/apk-sha256.txt 2>/dev/null || true)"
             echo "JADX exit code: $(cat results/jadx-exit-code.txt 2>/dev/null || echo unavailable)"
             echo "Java files: $(cat results/java-file-count.txt 2>/dev/null || echo 0)"
-            echo "APK SHA-256: $(awk '{print $1}' results/apk-sha256.txt 2>/dev/null || true)"
+            echo "Package size:"
+            du -sh package
           } > package/run-summary.txt
 
           find package -type f -name '*.log' -size +5M -exec truncate -s 5M {} \;
+          find package -type f | sort | head -300
           du -sh package
-          find package -type f | head -250
 
-      - name: Upload trace package
+      - name: Upload call-chain trace
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Tango-reference-trace
+          name: Tango-api-call-chains
           path: package/
           if-no-files-found: warn
           compression-level: 6
