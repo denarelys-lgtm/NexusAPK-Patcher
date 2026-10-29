@@ -35,7 +35,7 @@ jobs:
       - name: Prepare workspace
         run: |
           set -euo pipefail
-          mkdir -p work results
+          mkdir -p work results package
           df -h .
           java -version
 
@@ -95,9 +95,7 @@ jobs:
           ]
 
           if not assets:
-              raise SystemExit(
-                  "No se encontró el ZIP CLI de JADX."
-              )
+              raise SystemExit("JADX CLI ZIP not found.")
 
           selected = assets[0]
 
@@ -165,6 +163,7 @@ jobs:
 
               with open("results/apk-structure.txt", "w") as f:
                   f.write(f"Total ZIP entries: {len(names)}\n")
+
                   for key, value in sorted(counts.items()):
                       f.write(f"{key}: {value}\n")
 
@@ -265,7 +264,7 @@ jobs:
               Path("work/apktool-out"),
           ]
 
-          max_matches = 300
+          max_matches = 150
           counts = {key: 0 for key in patterns}
 
           with output.open("w", encoding="utf-8") as report:
@@ -281,9 +280,10 @@ jobs:
               ]:
                   path = Path("results") / filename
                   report.write(f"\n--- {filename} ---\n")
+
                   if path.exists():
                       report.write(
-                          path.read_text(errors="replace")[:20000]
+                          path.read_text(errors="replace")[:10000]
                       )
                   else:
                       report.write("Not available\n")
@@ -301,46 +301,78 @@ jobs:
                               continue
 
                           try:
-                              if path.stat().st_size > 2_000_000:
+                              if path.stat().st_size > 1_000_000:
                                   continue
-                              text = path.read_text(
-                                  encoding="utf-8",
-                                  errors="replace"
-                              )
-                          except OSError:
+
+                              with path.open(
+                                  "r", encoding="utf-8", errors="replace"
+                              ) as source:
+                                  for number, line in enumerate(source, 1):
+                                      if pattern.search(line):
+                                          total += 1
+
+                                          if counts[category] < max_matches:
+                                              report.write(
+                                                  f"{path}:{number}: "
+                                                  f"{line[:250]}\n"
+                                              )
+                                              counts[category] += 1
+                          except (OSError, UnicodeError):
                               continue
 
-                          for number, line in enumerate(
-                              text.splitlines(), 1
-                          ):
-                              if pattern.search(line):
-                                  total += 1
-                                  if counts[category] < max_matches:
-                                      report.write(
-                                          f"{path}:{number}: "
-                                          f"{line[:350]}\n"
-                                      )
-                                      counts[category] += 1
-
                   report.write(f"Matches found: {total}\n")
+
                   if total > max_matches:
                       report.write(
-                          f"Output capped at {max_matches} matches.\n"
+                          f"Displayed matches capped at {max_matches}.\n"
                       )
 
               report.write(
-                  "\nText matches are leads, not proof of functionality.\n"
+                  "\nKeyword matches are leads, not proof of functionality.\n"
               )
 
           print(f"Report written: {output}")
           PY
 
-      - name: Prepare analysis results
+      - name: Prepare compact investigation package
         if: always()
         run: |
           set -euo pipefail
 
-          mkdir -p results
+          mkdir -p package/relevant-source
+
+          # Copy reports and logs, not the entire decompilation.
+          cp results/*.txt package/ 2>/dev/null || true
+          cp results/*.log package/ 2>/dev/null || true
+
+          # Keep files with names potentially relevant to the investigation.
+          # These are preliminary filters, not an exhaustive code search.
+          find work/jadx-out -type f \
+            \( -iname '*LiveViewer*' \
+            -o -iname '*LiveBroadcast*' \
+            -o -iname '*CountryChooser*' \
+            -o -iname '*BalanceStorage*' \
+            -o -iname '*CoinsDataSource*' \
+            -o -iname '*ChatActivity*' \
+            -o -iname '*ChatRequestInbox*' \) \
+            -size -2M \
+            -exec cp --parents {} package/relevant-source/ \; \
+            2>/dev/null || true
+
+          # Keep large logs from overwhelming the download.
+          find package -type f -name '*.log' -size +5M \
+            -exec truncate -s 5M {} \;
+
+          echo "Compact package size:"
+          du -sh package
+
+          echo "Package contents:"
+          find package -type f | head -200
+
+      - name: Prepare run summary
+        if: always()
+        run: |
+          set -euo pipefail
 
           {
             echo "Analysis completed at: $(date -u +%FT%TZ)"
@@ -351,23 +383,22 @@ jobs:
             echo "Apktool exit code:"
             cat results/apktool-exit-code.txt 2>/dev/null || true
             echo
-            echo "Generated source files:"
-            find work/jadx-out work/apktool-out \
-              -type f 2>/dev/null | wc -l || true
+            echo "JADX source files:"
+            find work/jadx-out -type f 2>/dev/null | wc -l || true
+            echo
+            echo "Apktool files:"
+            find work/apktool-out -type f 2>/dev/null | wc -l || true
             echo
             echo "Disk usage:"
             df -h .
-          } > results/run-summary.txt
+          } > package/run-summary.txt
 
-      - name: Upload analysis artifacts
+      - name: Upload compact investigation package
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Tango-9.62.9-analysis
-          path: |
-            results/
-            work/jadx-out/
-            work/apktool-out/
+          name: Tango-investigation-compact
+          path: package/
           if-no-files-found: warn
-          compression-level: 0
+          compression-level: 6
           retention-days: 7
