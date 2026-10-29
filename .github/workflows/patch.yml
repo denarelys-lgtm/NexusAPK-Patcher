@@ -1,4 +1,4 @@
-name: NexusAPK Patcher
+name: NexusAPK Patcher location
 
 on:
   workflow_dispatch:
