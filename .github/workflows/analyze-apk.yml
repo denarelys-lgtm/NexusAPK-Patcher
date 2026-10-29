@@ -1,4 +1,4 @@
-name: Analyze Tango APK - Focused
+name: Trace Tango References
 
 on:
   workflow_dispatch:
@@ -7,11 +7,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: tango-apk-focused-analysis
+  group: tango-reference-trace
   cancel-in-progress: false
 
 jobs:
-  analyze:
+  trace:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -29,54 +29,31 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y curl unzip python3 file ripgrep
+          sudo apt-get install -y curl unzip python3 file
 
-      - name: Prepare workspace
-        run: |
-          set -euo pipefail
-          mkdir -p work results package
-          java -version
-          df -h .
+      - name: Prepare folders
+        run: mkdir -p work results package
 
-      - name: Download and verify original APK
+      - name: Download original APK
         env:
           APK_URL: https://github.com/denarelys-lgtm/NexusAPK-Patcher/releases/download/Apk/tango-Tango_APK-android-9.62.9-20260609140828-production-assemblefullrelease-all.apk
         run: |
           set -euo pipefail
           curl -fL --retry 3 --retry-delay 2 "$APK_URL" -o work/tango-original.apk
           test -s work/tango-original.apk
-          {
-            echo "File: tango-original.apk"
-            echo "Size bytes: $(stat -c '%s' work/tango-original.apk)"
-            echo "SHA-256: $(sha256sum work/tango-original.apk | awk '{print $1}')"
-            file work/tango-original.apk
-          } | tee results/apk-info.txt
+          sha256sum work/tango-original.apk | tee results/apk-sha256.txt
+          stat -c 'APK size bytes: %s' work/tango-original.apk | tee results/apk-size.txt
           unzip -tq work/tango-original.apk > results/apk-integrity.log
-          python3 - <<'PY'
-          import zipfile
-          from collections import Counter
-          with zipfile.ZipFile("work/tango-original.apk") as z:
-              names = z.namelist()
-          c = Counter()
-          for n in names:
-              if n.endswith(".dex"): c["dex_files"] += 1
-              if n.startswith("lib/") and n.endswith(".so"): c["native_libraries"] += 1
-              if n.startswith("res/"): c["resource_files"] += 1
-          with open("results/apk-structure.txt", "w") as f:
-              f.write(f"ZIP entries: {len(names)}\n")
-              for k, v in sorted(c.items()): f.write(f"{k}: {v}\n")
-              f.write("\nDEX files:\n")
-              f.writelines(n + "\n" for n in names if n.endswith(".dex"))
-          PY
 
       - name: Download JADX CLI
         run: |
           set -euo pipefail
-          mkdir -p work/jadx
           python3 - <<'PY'
           import json, urllib.request
-          url = "https://api.github.com/repos/skylot/jadx/releases/latest"
-          req = urllib.request.Request(url, headers={"User-Agent": "NexusAPK-Patcher"})
+          req = urllib.request.Request(
+              "https://api.github.com/repos/skylot/jadx/releases/latest",
+              headers={"User-Agent": "NexusAPK-Patcher"}
+          )
           with urllib.request.urlopen(req, timeout=30) as r:
               release = json.load(r)
           assets = [
@@ -86,9 +63,10 @@ jobs:
               and a["name"].endswith(".zip")
           ]
           if not assets:
-              raise SystemExit("No se encontró el ZIP CLI de JADX.")
-          with open("work/jadx-url.txt", "w") as f: f.write(assets[0])
-          print("JADX:", release.get("tag_name"), assets[0])
+              raise SystemExit("No JADX CLI ZIP found")
+          print("JADX release:", release["tag_name"])
+          with open("work/jadx-url.txt", "w") as f:
+              f.write(assets[0])
           PY
           curl -fL --retry 3 "$(cat work/jadx-url.txt)" -o work/jadx.zip
           unzip -q work/jadx.zip -d work/jadx
@@ -98,190 +76,158 @@ jobs:
           "$JADX_BIN" --version
           echo "JADX_BIN=$JADX_BIN" >> "$GITHUB_ENV"
 
-      - name: Download Apktool
-        run: |
-          set -euo pipefail
-          curl -fL --retry 3 \
-            https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar \
-            -o work/apktool.jar
-          java -jar work/apktool.jar --version
-
-      - name: Decompile with JADX
+      - name: Decompile APK
         continue-on-error: true
         run: |
-          set -uo pipefail
-          mkdir -p work/jadx-out
           set +e
           "$JADX_BIN" --threads-count 2 --show-bad-code \
             -d work/jadx-out work/tango-original.apk \
             > results/jadx.log 2>&1
-          status=$?
+          STATUS=$?
           set -e
-          echo "$status" > results/jadx-exit-code.txt
-          echo "JADX exit code: $status"
-          tail -60 results/jadx.log || true
+          echo "$STATUS" > results/jadx-exit-code.txt
+          echo "JADX exit code: $STATUS"
+          find work/jadx-out -type f -name '*.java' | wc -l | tee results/java-file-count.txt
 
-      - name: Decode Smali and resources with Apktool
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          set +e
-          java -Xmx4g -jar work/apktool.jar d -f \
-            work/tango-original.apk -o work/apktool-out \
-            > results/apktool.log 2>&1
-          status=$?
-          set -e
-          echo "$status" > results/apktool-exit-code.txt
-          echo "Apktool exit code: $status"
-          tail -60 results/apktool.log || true
-
-      - name: Build focused code and network investigation
+      - name: Trace model usages and feature call sites
         if: always()
         run: |
           set -euo pipefail
-          mkdir -p package/relevant-source package/snippets package/metadata
-          cp results/* package/metadata/ 2>/dev/null || true
-
           python3 - <<'PY'
-          import os, re, shutil
+          import re
           from pathlib import Path
 
-          roots = [Path("work/jadx-out/sources"), Path("work/apktool-out/smali")]
-          out = Path("package")
-          source_out = out / "relevant-source"
-          snippets_out = out / "snippets"
-          source_out.mkdir(parents=True, exist_ok=True)
-          snippets_out.mkdir(parents=True, exist_ok=True)
-
-          # Terms cover public LIVE discovery/navigation, region selection,
-          # balance/coins models, chat navigation and network/API plumbing.
+          root = Path("work/jadx-out")
+          out = Path("results/reference-trace.txt")
+          # Search full decompilation, not only files with matching names.
           groups = {
-              "live_navigation": re.compile(
-                  r"LiveViewer|LiveBroadcast|LiveCountry|live.?feed|live.?list|"
-                  r"broadcast.?id|stream.?id|viewer.?count|recommend", re.I),
-              "country_region": re.compile(
-                  r"CountryChooser|country.?code|country.?id|region.?id|"
-                  r"country.?picker|selectedCountry|locale", re.I),
-              "balance_coins": re.compile(
-                  r"BalanceStorageData|CoinsDataSource|coin.?balance|"
-                  r"wallet|coin.?amount|balance.?response|currency.?balance", re.I),
-              "chat": re.compile(
-                  r"ChatActivity|ChatRequestInbox|conversation.?id|"
-                  r"message.?thread|chat.?request|inbox", re.I),
-              "network_api": re.compile(
-                  r"retrofit2|@GET|@POST|@PUT|@DELETE|@PATCH|"
-                  r"baseUrl|base_url|okhttp3|graphql|ApolloClient|"
-                  r"Authorization|Bearer |endpoint|api/v[0-9]", re.I),
-              "models_serialization": re.compile(
-                  r"@SerializedName|@Json|JsonAdapter|Moshi|Gson|"
-                  r"data class .*Response|class .*Response|"
-                  r"BalanceStorageData|CoinsDataSource", re.I),
+              "Balance response model references": re.compile(
+                  r"UserBalanceResponse|GiftBalanceResponse|"
+                  r"PromotionCoinsClaimResponse|SavingsBalanceResponseProto"
+              ),
+              "Balance and coin logic": re.compile(
+                  r"userBalance|giftBalance|coinback|coinsBalance|"
+                  r"insufficient.?balance|claimCoinback|"
+                  r"PromotionCoinsAccessibilityResponse", re.I
+              ),
+              "Country picker and filtering": re.compile(
+                  r"LiveCountryChooserActivity|LiveCountryPickerFragment|"
+                  r"NearbyCountries|country.?code|country.?filter|"
+                  r"selectedCountries|initialCheckedList", re.I
+              ),
+              "LIVE viewer and discovery": re.compile(
+                  r"LiveViewerActivity|LiveViewerFragment|"
+                  r"LivePagingConfig|live.?viewer|live.?broadcast|"
+                  r"stream.?discovery|broadcast.?list", re.I
+              ),
+              "Chat repositories and navigation": re.compile(
+                  r"ChatActivity|ChatRequestInboxActivity|"
+                  r"conversationId|deleteAllChatRequest|"
+                  r"observeChat|syncFoldersForChat", re.I
+              ),
+              "Network declarations and request execution": re.compile(
+                  r"@GET|@POST|@PUT|@PATCH|@DELETE|"
+                  r"Retrofit|Request\.Builder|HttpUrl|"
+                  r"baseUrl|endpoint|GraphQL|grpc|"
+                  r"OkHttpClient|newCall\(", re.I
+              ),
+              "Potential endpoint strings": re.compile(
+                  r"""["']/(?:v[0-9]+/)?[A-Za-z0-9_./{}-]{2,}["']"""
+              ),
           }
 
-          # Copy a bounded number of likely useful full source files.
-          preferred = re.compile(
-              r"LiveViewer|LiveBroadcast|LiveCountry|CountryChooser|"
-              r"BalanceStorageData|CoinsDataSource|ChatActivity|"
-              r"ChatRequestInbox|Retrofit|ApiService|ApiClient|"
-              r"Balance.*(Response|Model|Data)|Coin.*(Response|Model|Data)", re.I
-          )
-          copied = 0
-          max_full_files = 100
-          max_full_file_bytes = 350_000
+          MAX_PER_GROUP = 180
+          MAX_LINE = 500
+          with out.open("w", encoding="utf-8") as report:
+              report.write("TANGO REFERENCE TRACE\n")
+              report.write("Searches are static leads, not proof of live server behavior.\n")
+              report.write("APK SHA-256:\n")
+              sha = Path("results/apk-sha256.txt")
+              if sha.exists():
+                  report.write(sha.read_text(errors="replace") + "\n")
 
-          for root in roots:
-              if not root.exists():
-                  continue
-              for path in root.rglob("*"):
-                  if not path.is_file() or not preferred.search(path.name):
+              for label, pattern in groups.items():
+                  report.write("\n\n" + "=" * 76 + "\n")
+                  report.write(label + "\n")
+                  report.write("=" * 76 + "\n")
+                  count = 0
+                  files_with_hits = 0
+                  if not root.exists():
+                      report.write("JADX output directory is missing.\n")
                       continue
-                  try:
-                      size = path.stat().st_size
-                      if size > max_full_file_bytes:
+                  for path in root.rglob("*"):
+                      if not path.is_file() or path.suffix not in {".java", ".kt", ".xml", ".json", ".txt"}:
                           continue
-                      relative = path.relative_to(root)
-                      dest = source_out / root.name / relative
-                      dest.parent.mkdir(parents=True, exist_ok=True)
-                      shutil.copy2(path, dest)
-                      copied += 1
-                      if copied >= max_full_files:
+                      try:
+                          if path.stat().st_size > 3_000_000:
+                              continue
+                          lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                      except OSError:
+                          continue
+                      local = []
+                      for i, line in enumerate(lines):
+                          if pattern.search(line):
+                              local.append((i, line))
+                      if not local:
+                          continue
+                      files_with_hits += 1
+                      for i, line in local:
+                          if count >= MAX_PER_GROUP:
+                              break
+                          report.write(f"\nFILE: {path}\nLINE: {i+1}\n")
+                          start, end = max(0, i-4), min(len(lines), i+5)
+                          for j in range(start, end):
+                              marker = ">>" if j == i else "  "
+                              report.write(f"{marker} {j+1}: {lines[j][:MAX_LINE]}\n")
+                          count += 1
+                      if count >= MAX_PER_GROUP:
                           break
-                  except OSError:
-                      pass
-              if copied >= max_full_files:
-                  break
+                  report.write(f"\nReported matches: {count}; files with hits scanned: {files_with_hits}\n")
+                  if count >= MAX_PER_GROUP:
+                      report.write("Output capped for package size. Increase MAX_PER_GROUP if needed.\n")
 
-          # Search all decompiled text, including Smali, and save bounded
-          # context snippets. Do not include binary files or entire output trees.
-          max_per_group = 180
-          context_lines = 2
-          counts = {name: 0 for name in groups}
-          totals = {name: 0 for name in groups}
-
-          for root in roots:
-              if not root.exists():
-                  continue
-              for path in root.rglob("*"):
-                  if not path.is_file():
-                      continue
-                  try:
-                      if path.stat().st_size > 2_000_000:
-                          continue
-                      text = path.read_text(encoding="utf-8", errors="replace")
-                  except OSError:
-                      continue
-                  lines = text.splitlines()
-                  for category, pattern in groups.items():
-                      hit_indexes = [i for i, line in enumerate(lines) if pattern.search(line)]
-                      if not hit_indexes:
-                          continue
-                      totals[category] += len(hit_indexes)
-                      target = snippets_out / f"{category}.txt"
-                      with target.open("a", encoding="utf-8") as f:
-                          for i in hit_indexes:
-                              if counts[category] >= max_per_group:
-                                  break
-                              start = max(0, i-context_lines)
-                              end = min(len(lines), i+context_lines+1)
-                              f.write(f"\n### {path}:{i+1}\n")
-                              for j in range(start, end):
-                                  f.write(f"{j+1}: {lines[j][:500]}\n")
-                              counts[category] += 1
-
-          with (out / "investigation-index.txt").open("w", encoding="utf-8") as f:
-              f.write("TANGO APK - FOCUSED INVESTIGATION\n")
-              f.write("This is static analysis; keyword hits are leads, not proof.\n\n")
-              f.write(f"Full source files copied: {copied}\n\n")
-              for name in groups:
-                  f.write(f"{name}: total matching lines={totals[name]}, "
-                          f"snippets saved={counts[name]}\n")
-              f.write("\nFolders:\n")
-              f.write("- metadata/: APK identity and tool logs\n")
-              f.write("- relevant-source/: selected complete source files\n")
-              f.write("- snippets/: references with surrounding lines\n")
-          print((out / "investigation-index.txt").read_text())
+          # Copy exact feature files plus report and logs for compact review.
+          print("Created", out, "bytes:", out.stat().st_size)
           PY
 
-      - name: Add run summary
+      - name: Build compact package
         if: always()
         run: |
           set -euo pipefail
+          mkdir -p package/relevant-source
+          cp results/* package/ 2>/dev/null || true
+
+          # Copy the main feature/model classes when available.
+          find work/jadx-out -type f \
+            \( -name '*UserBalanceResponse*' \
+            -o -name '*GiftBalanceResponse*' \
+            -o -name '*PromotionCoinsClaimResponse*' \
+            -o -name '*LiveCountryChooserActivity*' \
+            -o -name '*LiveCountryPickerFragment*' \
+            -o -name '*LiveViewerActivity*' \
+            -o -name '*LiveViewerFragment*' \
+            -o -name '*ChatActivity*' \
+            -o -name '*ChatRequestInbox*' \) \
+            -size -2M \
+            -exec cp --parents {} package/relevant-source/ \; \
+            2>/dev/null || true
+
           {
             echo "Completed UTC: $(date -u +%FT%TZ)"
             echo "JADX exit code: $(cat results/jadx-exit-code.txt 2>/dev/null || echo unavailable)"
-            echo "Apktool exit code: $(cat results/apktool-exit-code.txt 2>/dev/null || echo unavailable)"
-            echo "JADX output files: $(find work/jadx-out -type f 2>/dev/null | wc -l)"
-            echo "Apktool output files: $(find work/apktool-out -type f 2>/dev/null | wc -l)"
-            echo "Compact package size:"
-            du -sh package
+            echo "Java files: $(cat results/java-file-count.txt 2>/dev/null || echo 0)"
+            echo "APK SHA-256: $(awk '{print $1}' results/apk-sha256.txt 2>/dev/null || true)"
           } > package/run-summary.txt
-          cat package/run-summary.txt
 
-      - name: Upload focused investigation package
+          find package -type f -name '*.log' -size +5M -exec truncate -s 5M {} \;
+          du -sh package
+          find package -type f | head -250
+
+      - name: Upload trace package
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Tango-focused-investigation
+          name: Tango-reference-trace
           path: package/
           if-no-files-found: warn
           compression-level: 6
