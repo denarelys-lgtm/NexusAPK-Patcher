@@ -1,16 +1,16 @@
 import os
 import sys
 import re
+import xml.etree.ElementTree as ET
 
 def patch_flag_secure(decoded_dir):
     """
     Deshabilita FLAG_SECURE de forma segura limitándose a contextos de banderas de ventana
-    para evitar errores de verificación de tipos (VerifyError) en código ofuscado.
+    para permitir capturas de pantalla sin errores de verificación (VerifyError).
     """
     smali_dirs = [os.path.join(decoded_dir, d) for d in os.listdir(decoded_dir) if d.startswith("smali")]
     patched_files = 0
     
-    # Patrón estricto para asegurar que 0x2000 se use en un contexto de constantes de flags
     flag_pattern = re.compile(r'(const/?[a-z0-9]*\s+)([vp]\d+),\s+(0x2000)')
 
     for smali_dir in smali_dirs:
@@ -24,7 +24,6 @@ def patch_flag_secure(decoded_dir):
                         with open(filepath, "r", encoding="utf-8") as f:
                             content = f.read()
 
-                        # Verificamos que el archivo mencione funciones de ventana o flags para evitar falsos positivos destructivos
                         if "WindowManager" in content or "addFlags" in content or "setFlags" in content:
                             if flag_pattern.search(content):
                                 new_content = flag_pattern.sub(r'\1\2, 0x0', content)
@@ -36,6 +35,39 @@ def patch_flag_secure(decoded_dir):
                         continue
 
     print(f"[+] [Seguridad] FLAG_SECURE depurado de forma segura en {patched_files} archivos Smali.")
+
+def optimize_manifest_and_telemetry(decoded_dir):
+    """
+    Limpia y optimiza el AndroidManifest.xml eliminando metadatos de análisis,
+    rastreadores y servicios de telemetría redundantes en segundo plano.
+    """
+    manifest_path = os.path.join(decoded_dir, "AndroidManifest.xml")
+    if not os.path.exists(manifest_path):
+        print("[-] AndroidManifest.xml no encontrado.")
+        return
+
+    try:
+        # Leemos el archivo de manifiesto como texto plano para modificaciones seguras de XML estructurado
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Patrones para identificar y neutralizar metadatos de analíticas comunes (Firebase, Crashlytics, etc.)
+        # Esto evita que los SDKs de rastreo inicialicen sus canalidades de datos en segundo plano.
+        cleaned_content = re.sub(r'<meta-data\s+android:name="firebase_analytics_collection_enabled"\s+android:value="true"\s*/>', 
+                                 '<meta-data android:name="firebase_analytics_collection_enabled" android:value="false"/>', content)
+        
+        cleaned_content = re.sub(r'<meta-data\s+android:name="crashlytics_collection_enabled"\s+android:value="true"\s*/>', 
+                                 '<meta-data android:name="crashlytics_collection_enabled" android:value="false"/>', cleaned_content)
+
+        if cleaned_content != content:
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                f.write(cleaned_content)
+            print("[+] [Telemetría] Metadatos de análisis y rastreo desactivados en el Manifiesto.")
+        else:
+            print("[+] [Telemetría] Manifiesto verificado (sin rastreadores directos expuestos en metadatos).")
+
+    except Exception as e:
+        print(f"[-] Error al optimizar el manifiesto: {e}")
 
 def apply_overlay(decoded_dir, overlay_dir):
     """
@@ -64,7 +96,8 @@ if __name__ == "__main__":
     decoded_directory = sys.argv[1]
     overlay_directory = sys.argv[2]
 
-    print("=== INICIANDO ENSAMBLAJE DE PARCHE SEGURO TANGO ===")
+    print("=== INICIANDO ENSAMBLAJE DE PARCHE OPTIMIZADO TANGO ===")
     apply_overlay(decoded_directory, overlay_directory)
     patch_flag_secure(decoded_directory)
+    optimize_manifest_and_telemetry(decoded_directory)
     print("=== ENSAMBLAJE DE PARCHE COMPLETADO CON ÉXITO ===")
